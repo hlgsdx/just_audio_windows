@@ -9,7 +9,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(PLUGIN_NAME "just_audio_windows_plugin")
 
 add_library(${PLUGIN_NAME} SHARED
+  "duration_state.hpp"
   "just_audio_windows_plugin.cpp"
+  "platform_task_runner.hpp"
   "player.hpp"
 )
 apply_standard_settings(${PLUGIN_NAME})
@@ -49,6 +51,7 @@ if (${include_${PROJECT_NAME}_tests})
   # uri_utils.hpp is a header-only, WinRT-free helper, so the test binary
   # needs no plugin sources or special Windows libraries.
   add_executable(${TEST_RUNNER}
+    test/duration_state_test.cpp
     test/uri_utils_test.cpp
   )
   apply_standard_settings(${TEST_RUNNER})
@@ -59,4 +62,3 @@ if (${include_${PROJECT_NAME}_tests})
   include(GoogleTest)
   gtest_discover_tests(${TEST_RUNNER})
 endif()
-

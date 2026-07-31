@@ -1,6 +1,8 @@
 #pragma comment(lib, "windowsapp")
 
+#include <atomic>
 #include <chrono>
+#include <memory>
 
 // This must be included before many other Windows headers.
 #include <windows.h>
@@ -10,6 +12,8 @@
 #include <flutter/method_channel.h>
 #include <flutter/standard_method_codec.h>
 
+#include "duration_state.hpp"
+#include "platform_task_runner.hpp"
 #include "uri_utils.hpp"
 
 #include <winrt/Windows.Foundation.Collections.h>
@@ -18,8 +22,8 @@
 #include <winrt/Windows.Media.Core.h>
 #include <winrt/Windows.Media.Playback.h>
 #include <winrt/Windows.System.h>
-#define TO_MILLISECONDS(timespan) timespan.count() / 10000
-#define TO_MICROSECONDS(timespan) TO_MILLISECONDS(timespan) * 1000
+#define TO_MILLISECONDS(timespan) (timespan).count() / 10000
+#define TO_MICROSECONDS(timespan) (timespan).count() / 10
 
 using flutter::EncodableMap;
 using flutter::EncodableValue;
@@ -118,19 +122,35 @@ private:
 
 class AudioPlayer {
 private:
-  bool disposed_ = false;
+  struct DeliveryState {
+    DeliveryState(flutter::BinaryMessenger* messenger, const std::string& id)
+        : event_sink(std::make_unique<JustAudioEventSink>(
+              messenger, "com.ryanheise.just_audio.events." + id)),
+          data_sink(std::make_unique<JustAudioEventSink>(
+              messenger, "com.ryanheise.just_audio.data." + id)) {}
+
+    bool active = true;
+    std::unique_ptr<JustAudioEventSink> event_sink;
+    std::unique_ptr<JustAudioEventSink> data_sink;
+  };
+
+  std::atomic<bool> disposed_ = false;
+  std::shared_ptr<just_audio_windows::PlatformTaskRunner> task_runner_;
+  std::shared_ptr<DeliveryState> delivery_state_;
+  just_audio_windows::DurationState duration_state_;
 
   void Dispose() {
-    if (disposed_) return;
-    disposed_ = true;
+    if (disposed_.exchange(true)) return;
     auto session = mediaPlayer.PlaybackSession();
     session.PlaybackStateChanged(playback_state_token_);
+    session.NaturalDurationChanged(natural_duration_token_);
     mediaPlayer.MediaFailed(media_failed_token_);
     mediaPlaybackList.CurrentItemChanged(item_changed_token_);
     mediaPlaybackList.ItemFailed(item_failed_token_);
     player_channel_->SetMethodCallHandler(nullptr);
-    event_sink_.reset();
-    data_sink_.reset();
+    delivery_state_->active = false;
+    delivery_state_->event_sink.reset();
+    delivery_state_->data_sink.reset();
     mediaPlayer.Close();
   }
 public:
@@ -139,17 +159,21 @@ public:
   Playback::MediaPlaybackList mediaPlaybackList{};
 
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> player_channel_;
-  std::unique_ptr<JustAudioEventSink> event_sink_ = nullptr;
-  std::unique_ptr<JustAudioEventSink> data_sink_ = nullptr;
 
   // Tokens for event unsubscription
   winrt::event_token playback_state_token_{};
+  winrt::event_token natural_duration_token_{};
   winrt::event_token media_failed_token_{};
   winrt::event_token item_changed_token_{};
   winrt::event_token item_failed_token_{};
 
 public:
-  AudioPlayer::AudioPlayer(std::string idx, flutter::BinaryMessenger* messenger) {
+  AudioPlayer::AudioPlayer(
+      std::string idx,
+      std::shared_ptr<just_audio_windows::PlatformTaskRunner> task_runner,
+      flutter::BinaryMessenger* messenger)
+      : task_runner_(std::move(task_runner)),
+        delivery_state_(std::make_shared<DeliveryState>(messenger, idx)) {
     id = idx;
 
     // Set up channels
@@ -164,19 +188,22 @@ public:
       player->HandleMethodCall(call, std::move(result));
     });
 
-    event_sink_ = std::make_unique<JustAudioEventSink>(messenger, "com.ryanheise.just_audio.events." + idx);
-    data_sink_ = std::make_unique<JustAudioEventSink>(messenger, "com.ryanheise.just_audio.data." + idx);
-
     /// Set up event callbacks
     // Playback event
     playback_state_token_ = mediaPlayer.PlaybackSession().PlaybackStateChanged([this](auto, const auto& args) -> void {
-      if (disposed_) return;
+      if (disposed_.load()) return;
+      broadcastState();
+    });
+
+    // Duration may become available after load completes.
+    natural_duration_token_ = mediaPlayer.PlaybackSession().NaturalDurationChanged([this](auto, const auto& args) -> void {
+      if (disposed_.load()) return;
       broadcastState();
     });
 
     // Player error event
     media_failed_token_ = mediaPlayer.MediaFailed([this](auto, const Playback::MediaPlayerFailedEventArgs& args) -> void {
-      if (disposed_) return;
+      if (disposed_.load()) return;
       std::string errorMessage = winrt::to_string(args.ErrorMessage());
 
       std::cerr << "[just_audio_windows] Media error: " << errorMessage << std::endl;
@@ -200,16 +227,16 @@ public:
         break;
       }
 
-      event_sink_->Error(code, errorMessage);
+      postPlaybackError(code, errorMessage);
     });
 
     mediaPlaybackList.MaxPlayedItemsToKeepOpen(2);
     item_changed_token_ = mediaPlaybackList.CurrentItemChanged([this](auto, const auto& args) -> void {
-      if (disposed_) return;
+      if (disposed_.load()) return;
       broadcastState();
     });
     item_failed_token_ = mediaPlaybackList.ItemFailed([this](auto, const Playback::MediaPlaybackItemFailedEventArgs& args) -> void {
-      if (disposed_) return;
+      if (disposed_.load()) return;
       auto error = winrt::hresult_error(args.Error().ExtendedError());
 
       auto message = winrt::to_string(error.message());
@@ -236,7 +263,7 @@ public:
         break;
       }
 
-      event_sink_->Error(code, message);
+      postPlaybackError(code, message);
     });
   }
 
@@ -261,6 +288,7 @@ public:
       const auto* initialPosition = std::get_if<int>(ValueOrNull(*args, "initialPosition"));
       const auto* initialIndex = std::get_if<int>(ValueOrNull(*args, "initialIndex"));
 
+      duration_state_.Reset();
       try {
         loadSource(*audioSourceData);
       } catch (char* error) {
@@ -275,14 +303,21 @@ public:
         seekToPosition(*initialPosition);
       }
 
-      result->Success(flutter::EncodableMap());
+      auto response = flutter::EncodableMap();
+      const auto duration = duration_state_.ObserveTicks(
+          mediaPlayer.PlaybackSession().NaturalDuration().count());
+      response[flutter::EncodableValue("duration")] =
+          duration.has_value()
+              ? flutter::EncodableValue(duration.value())
+              : flutter::EncodableValue();
+      result->Success(response);
     } else if (method_call.method_name().compare("play") == 0) {
-      if (!disposed_) {
+      if (!disposed_.load()) {
         mediaPlayer.Play();
       }
       result->Success(flutter::EncodableMap());
     } else if (method_call.method_name().compare("pause") == 0) {
-      if (!disposed_) {
+      if (!disposed_.load()) {
         mediaPlayer.Pause();
       }
       result->Success(flutter::EncodableMap());
@@ -292,7 +327,7 @@ public:
         return result->Error("volume_error", "volume argument missing");
       }
       float volumeFloat = (float)*volume;
-      if (!disposed_) {
+      if (!disposed_.load()) {
         mediaPlayer.Volume(volumeFloat);
       }
       result->Success(flutter::EncodableMap());
@@ -302,7 +337,7 @@ public:
         return result->Error("speed_error", "speed argument missing");
       }
       float speedFloat = (float)*speed;
-      if (!disposed_) {
+      if (!disposed_.load()) {
         mediaPlayer.PlaybackRate(speedFloat);
       }
       result->Success(flutter::EncodableMap());
@@ -316,7 +351,7 @@ public:
         return result->Error("loopMode_error", "loopMode argument missing");
       }
 
-      if (!disposed_) {
+      if (!disposed_.load()) {
         switch (*loopModePtr) {
         case 0: // off
           mediaPlayer.IsLoopingEnabled(false);
@@ -455,7 +490,7 @@ public:
   }
 
   void AudioPlayer::loadSource(const flutter::EncodableMap& source) const& {
-    if(disposed_) return;
+    if(disposed_.load()) return;
     auto items = mediaPlaybackList.Items();
     items.Clear(); // Always clear the list since we are resetting
 
@@ -545,13 +580,25 @@ public:
     }
   }
 
+  void AudioPlayer::postPlaybackError(
+      const std::string& code,
+      const std::string& message) {
+    auto delivery = delivery_state_;
+    task_runner_->Post([delivery, code, message]() {
+      if (delivery->active && delivery->event_sink) {
+        delivery->event_sink->Error(code, message);
+      }
+    });
+  }
+
   void AudioPlayer::broadcastPlaybackEvent() {
-    if(disposed_) return;
+    if(disposed_.load()) return;
     auto session = mediaPlayer.PlaybackSession();
 
     auto eventData = flutter::EncodableMap();
 
-    auto duration = TO_MICROSECONDS(session.NaturalDuration());
+    const auto duration =
+        duration_state_.ObserveTicks(session.NaturalDuration().count());
 
     auto now = std::chrono::system_clock::now();
 
@@ -571,8 +618,15 @@ public:
     eventData[flutter::EncodableValue("processingState")] = flutter::EncodableValue(processingState(session.PlaybackState()));
     eventData[flutter::EncodableValue("updatePosition")] = flutter::EncodableValue(TO_MICROSECONDS(session.Position())); //int
     eventData[flutter::EncodableValue("updateTime")] = flutter::EncodableValue(TO_MILLISECONDS(now.time_since_epoch())); //int
-    eventData[flutter::EncodableValue("bufferedPosition")] = flutter::EncodableValue((int64_t)(duration * bufferingProgress)); //int
-    eventData[flutter::EncodableValue("duration")] = flutter::EncodableValue(duration); //int
+    eventData[flutter::EncodableValue("bufferedPosition")] =
+        flutter::EncodableValue(
+            duration.has_value()
+                ? static_cast<int64_t>(duration.value() * bufferingProgress)
+                : int64_t{0});
+    eventData[flutter::EncodableValue("duration")] =
+        duration.has_value()
+            ? flutter::EncodableValue(duration.value())
+            : flutter::EncodableValue();
 
     if (mediaPlaybackList.Items().Size() > 0) {
       int64_t currentIndex = mediaPlaybackList.CurrentItemIndex();
@@ -583,11 +637,17 @@ public:
       eventData[flutter::EncodableValue("currentIndex")] = flutter::EncodableValue(0); //int
     }
 
-    event_sink_->Success(eventData);
+    auto delivery = delivery_state_;
+    task_runner_->Post(
+        [delivery, event_data = std::move(eventData)]() mutable {
+          if (delivery->active && delivery->event_sink) {
+            delivery->event_sink->Success(event_data);
+          }
+        });
   }
 
   int AudioPlayer::processingState(Playback::MediaPlaybackState state) {
-    if(disposed_) return 0;
+    if(disposed_.load()) return 0;
     auto session = mediaPlayer.PlaybackSession();
 
     if (state == Playback::MediaPlaybackState::None) {
@@ -603,7 +663,7 @@ public:
   }
 
   void AudioPlayer::broadcastDataEvent() {
-    if(disposed_) return;
+    if(disposed_.load()) return;
     auto session = mediaPlayer.PlaybackSession();
     auto eventData = flutter::EncodableMap();
 
@@ -615,7 +675,13 @@ public:
     eventData[flutter::EncodableValue("loopMode")] = flutter::EncodableValue(getLoopMode());
     eventData[flutter::EncodableValue("shuffleMode")] = flutter::EncodableValue(getShuffleMode());
 
-    data_sink_->Success(eventData);
+    auto delivery = delivery_state_;
+    task_runner_->Post(
+        [delivery, event_data = std::move(eventData)]() mutable {
+          if (delivery->active && delivery->data_sink) {
+            delivery->data_sink->Success(event_data);
+          }
+        });
   }
 
   int AudioPlayer::getLoopMode() {
@@ -666,7 +732,7 @@ public:
   }
 
   void AudioPlayer::seekToPosition(int64_t microseconds) {
-    if(disposed_) return;
+    if(disposed_.load()) return;
     mediaPlayer.Position(TimeSpan(std::chrono::microseconds(microseconds)));
 
     broadcastState();

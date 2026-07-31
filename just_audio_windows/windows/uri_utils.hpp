@@ -10,7 +10,7 @@
 // modified, because they contain no literal space character.
 inline std::string EncodeSpacesInUri(const std::string& uri) {
   std::string encoded;
-  // Reserve worst-case capacity (every char is a space → 3 chars each).
+  // Reserve worst-case capacity (every char is a space -> 3 chars each).
   encoded.reserve(uri.length() * 3);
   for (char c : uri) {
     if (c == ' ') {
