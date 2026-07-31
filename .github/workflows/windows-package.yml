@@ -1,0 +1,96 @@
+name: Windows package
+
+on:
+  push:
+    paths:
+      - "just_audio_windows/**"
+      - ".github/workflows/windows-package.yml"
+  pull_request:
+    paths:
+      - "just_audio_windows/**"
+      - ".github/workflows/windows-package.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: "3.38.10"
+
+jobs:
+  build-and-test:
+    name: Build and test just_audio_windows
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Get package dependencies
+        working-directory: just_audio_windows
+        run: flutter pub get
+
+      - name: Check Dart formatting
+        working-directory: just_audio_windows
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Analyze Dart package
+        working-directory: just_audio_windows
+        run: flutter analyze
+
+      - name: Create Windows host project
+        shell: pwsh
+        run: |
+          flutter create --no-pub --platforms=windows --project-name just_audio_windows_ci .ci/windows_host
+          $pubspecPath = ".ci/windows_host/pubspec.yaml"
+          $pubspec = Get-Content $pubspecPath -Raw
+          $pubspec = $pubspec -replace "(?m)^dependencies:\r?\n", "dependencies:`n  just_audio_windows:`n    path: ../../just_audio_windows`n"
+          Set-Content -Path $pubspecPath -Value $pubspec -NoNewline
+          $cmakePath = ".ci/windows_host/windows/CMakeLists.txt"
+          $cmake = Get-Content $cmakePath -Raw
+          $cmake = $cmake -replace "(?m)^include\(flutter/generated_plugins.cmake\)", "set(include_just_audio_windows_tests TRUE)`ninclude(flutter/generated_plugins.cmake)"
+          Set-Content -Path $cmakePath -Value $cmake -NoNewline
+
+      - name: Resolve Windows host dependencies
+        working-directory: .ci/windows_host
+        run: flutter pub get
+
+      - name: Build Windows host and plugin
+        working-directory: .ci/windows_host
+        run: flutter build windows --debug --no-pub
+
+      - name: Build native unit-test target
+        working-directory: .ci/windows_host
+        run: cmake --build build/windows/x64 --config Debug --target just_audio_windows_test --parallel
+
+      - name: Verify native unit tests are registered
+        working-directory: .ci/windows_host
+        shell: pwsh
+        run: |
+          $testDir = "build/windows/x64/plugins/just_audio_windows"
+          $listing = @(ctest --test-dir $testDir -C Debug -N)
+          $listing | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -ne 0) {
+            throw "CTest could not inspect the native test directory: $testDir"
+          }
+          $listingText = $listing -join "`n"
+          $match = [regex]::Match($listingText, "Total Tests:\s+(\d+)")
+          if (-not $match.Success -or [int]$match.Groups[1].Value -lt 1) {
+            throw "CTest registered no native tests in $testDir"
+          }
+
+      - name: Run native unit tests
+        working-directory: .ci/windows_host
+        shell: pwsh
+        run: |
+          ctest --test-dir build/windows/x64/plugins/just_audio_windows -C Debug --output-on-failure
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
